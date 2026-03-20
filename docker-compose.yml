@@ -1,0 +1,98 @@
+version: '3.8'
+
+services:
+  # MySQL 数据库
+  mysql:
+    image: mysql:8.0
+    container_name: warehouse_mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-warehouse_db}
+      MYSQL_USER: ${MYSQL_USER:-warehouse}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-warehouse123}
+    ports:
+      - "${MYSQL_PORT:-3307}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: 
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max_connections=1000
+    networks:
+      - warehouse_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 后端服务
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: warehouse_backend
+    restart: always
+    environment:
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_NAME=${MYSQL_DATABASE:-warehouse_db}
+      - DB_USER=${MYSQL_USER:-warehouse}
+      - DB_PASSWORD=${MYSQL_PASSWORD:-warehouse123}
+      - JWT_SECRET=${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+      - ADMIN_REAL_NAME=${ADMIN_REAL_NAME:-系统管理员}
+    ports:
+      - "${BACKEND_PORT:-8003}:8003"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+    networks:
+      - warehouse_network
+
+  # 前端服务
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: warehouse_frontend
+    restart: always
+    ports:
+      - "${FRONTEND_PORT:-3003}:3003"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - warehouse_network
+
+  # Nginx 反向代理
+  nginx:
+    image: nginx:latest
+    container_name: warehouse_nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8080}:80"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - warehouse_network
+
+volumes:
+  mysql_data:
+    driver: local
+
+networks:
+  warehouse_network:
+    driver: bridge
