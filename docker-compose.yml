@@ -1,7 +1,6 @@
-version: '3.8'
+version: '2.4'
 
 services:
-  # MySQL 数据库
   mysql:
     image: mysql:8.0
     container_name: warehouse_mysql
@@ -16,7 +15,7 @@ services:
     volumes:
       - mysql_data:/var/lib/mysql
       - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    command: 
+    command:
       - --default-authentication-plugin=mysql_native_password
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
@@ -29,7 +28,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # 后端服务
   backend:
     build:
       context: ./backend
@@ -57,7 +55,6 @@ services:
     networks:
       - warehouse_network
 
-  # 前端服务
   frontend:
     build:
       context: ./frontend
@@ -74,7 +71,6 @@ services:
     networks:
       - warehouse_network
 
-  # Nginx 反向代理
   nginx:
     image: nginx:latest
     container_name: warehouse_nginx
@@ -91,7 +87,6 @@ services:
 
 volumes:
   mysql_data:
-    driver: local
 
 networks:
   warehouse_network:

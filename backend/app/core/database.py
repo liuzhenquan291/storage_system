@@ -8,21 +8,41 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
 
+# 判断数据库类型
+is_sqlite = settings.DB_TYPE.lower() == "sqlite"
+
 # 同步引擎（用于初始化）
-sync_engine = create_engine(
-    settings.DATABASE_URL.replace("+pymysql", "+aiomysql"),
-    echo=False,
-    pool_pre_ping=True,
-    pool_recycle=3600
-)
+if is_sqlite:
+    sync_database_url = settings.DATABASE_URL.replace("+aiosqlite", "")
+    sync_engine = create_engine(
+        sync_database_url,
+        echo=False,
+        connect_args={"check_same_thread": False}
+    )
+else:
+    sync_database_url = settings.DATABASE_URL.replace("+pymysql", "+aiomysql")
+    sync_engine = create_engine(
+        sync_database_url,
+        echo=False,
+        pool_pre_ping=True,
+        pool_recycle=3600
+    )
 
 # 异步引擎
-engine = create_async_engine(
-    settings.DATABASE_URL.replace("+pymysql", "+aiomysql"),
-    echo=False,
-    pool_pre_ping=True,
-    pool_recycle=3600
-)
+if is_sqlite:
+    engine = create_async_engine(
+        settings.DATABASE_URL,
+        echo=False,
+        connect_args={"check_same_thread": False}
+    )
+else:
+    async_database_url = settings.DATABASE_URL.replace("+pymysql", "+aiomysql")
+    engine = create_async_engine(
+        async_database_url,
+        echo=False,
+        pool_pre_ping=True,
+        pool_recycle=3600
+    )
 
 # 异步会话工厂
 AsyncSessionLocal = async_sessionmaker(
