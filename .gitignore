@@ -54,6 +54,7 @@ logs/
 .env
 .env.local
 .env.*.local
+.env.bak
 
 # Database
 *.db

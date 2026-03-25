@@ -209,12 +209,53 @@ JWT_SECRET=$(openssl rand -hex 32 2>/dev/null || head -c 64 /dev/urandom | xxd -
 
 # 检查 .env 文件是否存在
 if [ -f "$ENV_FILE" ]; then
-    log_warn ".env 文件已存在"
-    read -p "是否覆盖配置? (y/n): " overwrite
-    if [ "$overwrite" != "y" ] && [ "$overwrite" != "Y" ]; then
-        log_info "保留现有 .env 配置"
+    log_info "检测到已存在的 .env 文件"
+    
+    # 检查是否已配置 SQLite
+    if grep -q "DB_TYPE=sqlite" "$ENV_FILE"; then
+        log_success ".env 已配置为 SQLite，跳过配置步骤"
+        create_env=false
     else
-        create_env=true
+        log_warn ".env 使用的是 MySQL 配置，需要切换为 SQLite"
+        read -p "是否自动修改为 SQLite 配置? (y/n) [默认: y]: " convert_sqlite
+        convert_sqlite=${convert_sqlite:-y}
+        
+        if [ "$convert_sqlite" = "y" ] || [ "$convert_sqlite" = "Y" ]; then
+            # 读取现有配置
+            ADMIN_USERNAME=$(grep "^ADMIN_USERNAME=" "$ENV_FILE" | cut -d= -f2 || echo "admin")
+            ADMIN_PASSWORD=$(grep "^ADMIN_PASSWORD=" "$ENV_FILE" | cut -d= -f2 || echo "admin123")
+            ADMIN_REAL_NAME=$(grep "^ADMIN_REAL_NAME=" "$ENV_FILE" | cut -d= -f2 || echo "系统管理员")
+            
+            # 备份原配置
+            cp "$ENV_FILE" "$ENV_FILE.bak.$(date +%Y%m%d%H%M%S)"
+            
+            # 重写为 SQLite 配置
+            cat > "$ENV_FILE" << EOF
+# 数据库配置 (SQLite)
+DB_TYPE=sqlite
+SQLITE_PATH=./warehouse.db
+
+# JWT 配置
+JWT_SECRET=$JWT_SECRET
+JWT_ALGORITHM=HS256
+JWT_EXPIRE_HOURS=2
+
+# 管理员配置
+ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+ADMIN_REAL_NAME=${ADMIN_REAL_NAME:-系统管理员}
+
+# 端口配置
+BACKEND_PORT=8003
+FRONTEND_PORT=3003
+EOF
+            log_success ".env 已更新为 SQLite 配置，原配置已备份"
+            create_env=false
+        else
+            log_warn "保留 MySQL 配置，但鸿蒙部署需要 SQLite"
+            log_info "请手动修改 .env，添加: DB_TYPE=sqlite 和 SQLITE_PATH=./warehouse.db"
+            read -p "按回车继续..."
+        fi
     fi
 else
     create_env=true
@@ -330,62 +371,152 @@ PYTHON_EOF
 log_success "数据库初始化完成"
 
 # ====================
-# 9. 创建启动脚本
+# 9. 创建 Systemd 服务
 # ====================
-log_info "创建启动脚本..."
+log_info "创建 Systemd 服务..."
 
-START_SCRIPT="$PROJECT_DIR/start_harmony.sh"
+# 创建日志目录
+mkdir -p "$PROJECT_DIR/logs"
 
-cat > "$START_SCRIPT" << 'EOF'
+# 后端服务
+BACKEND_SERVICE="/etc/systemd/system/warehouse-backend.service"
+sudo tee "$BACKEND_SERVICE" > /dev/null << EOF
+[Unit]
+Description=Warehouse Backend Service
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$PROJECT_DIR/backend
+Environment="PATH=$PROJECT_DIR/backend/venv/bin"
+Environment="DB_TYPE=sqlite"
+Environment="SQLITE_PATH=$PROJECT_DIR/backend/warehouse.db"
+EnvironmentFile=$PROJECT_DIR/.env
+ExecStart=$PROJECT_DIR/backend/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8003
+Restart=always
+RestartSec=5
+StandardOutput=append:$PROJECT_DIR/logs/backend.log
+StandardError=append:$PROJECT_DIR/logs/backend-error.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 前端服务
+FRONTEND_SERVICE="/etc/systemd/system/warehouse-frontend.service"
+sudo tee "$FRONTEND_SERVICE" > /dev/null << EOF
+[Unit]
+Description=Warehouse Frontend Service
+After=network.target warehouse-backend.service
+Requires=warehouse-backend.service
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$PROJECT_DIR/frontend
+ExecStart=/usr/bin/npm run dev
+Restart=always
+RestartSec=5
+StandardOutput=append:$PROJECT_DIR/logs/frontend.log
+StandardError=append:$PROJECT_DIR/logs/frontend-error.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 重新加载 systemd
+sudo systemctl daemon-reload
+
+# 启用开机自启
+sudo systemctl enable warehouse-backend.service
+sudo systemctl enable warehouse-frontend.service
+
+log_success "Systemd 服务已创建"
+
+# 创建管理脚本
+MANAGE_SCRIPT="$PROJECT_DIR/manage.sh"
+cat > "$MANAGE_SCRIPT" << 'MEOF'
 #!/bin/bash
 #
-# 鸿蒙系统启动脚本
+# 仓储系统服务管理脚本
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
 
 # 颜色定义
+RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-echo -e "${BLUE}=====================================${NC}"
-echo -e "${BLUE}  仓储物资管理系统 - 启动服务      ${NC}"
-echo -e "${BLUE}=====================================${NC}"
+show_help() {
+    echo "用法: ./manage.sh [命令]"
+    echo ""
+    echo "命令:"
+    echo "  start     启动服务"
+    echo "  stop      停止服务"
+    echo "  restart   重启服务"
+    echo "  status    查看状态"
+    echo "  logs      查看日志"
+    echo "  enable    设置开机自启"
+    echo "  disable   取消开机自启"
+}
 
-# 启动后端
-echo -e "${GREEN}[1/2] 启动后端服务 (端口: 8003)...${NC}"
-cd "$SCRIPT_DIR/backend"
-source venv/bin/activate
-python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8003 --reload &
-BACKEND_PID=$!
-echo "后端 PID: $BACKEND_PID"
+case "$1" in
+    start)
+        echo -e "${GREEN}启动服务...${NC}"
+        sudo systemctl start warehouse-backend
+        sudo systemctl start warehouse-frontend
+        echo -e "${GREEN}服务已启动${NC}"
+        echo "  后端: http://localhost:8003"
+        echo "  前端: http://localhost:3003"
+        ;;
+    stop)
+        echo -e "${YELLOW}停止服务...${NC}"
+        sudo systemctl stop warehouse-frontend
+        sudo systemctl stop warehouse-backend
+        echo -e "${GREEN}服务已停止${NC}"
+        ;;
+    restart)
+        echo -e "${YELLOW}重启服务...${NC}"
+        sudo systemctl restart warehouse-backend
+        sudo systemctl restart warehouse-frontend
+        echo -e "${GREEN}服务已重启${NC}"
+        ;;
+    status)
+        echo -e "${BLUE}服务状态:${NC}"
+        echo ""
+        echo "后端服务:"
+        sudo systemctl status warehouse-backend --no-pager -l
+        echo ""
+        echo "前端服务:"
+        sudo systemctl status warehouse-frontend --no-pager -l
+        ;;
+    logs)
+        echo -e "${BLUE}查看日志 (按 Ctrl+C 退出):${NC}"
+        echo ""
+        tail -f "$SCRIPT_DIR/logs/"*.log 2>/dev/null
+        ;;
+    enable)
+        sudo systemctl enable warehouse-backend
+        sudo systemctl enable warehouse-frontend
+        echo -e "${GREEN}已设置开机自启${NC}"
+        ;;
+    disable)
+        sudo systemctl disable warehouse-backend
+        sudo systemctl disable warehouse-frontend
+        echo -e "${YELLOW}已取消开机自启${NC}"
+        ;;
+    *)
+        show_help
+        ;;
+esac
+MEOF
 
-# 等待后端启动
-sleep 3
-
-# 启动前端
-echo -e "${GREEN}[2/2] 启动前端服务 (端口: 3003)...${NC}"
-cd "$SCRIPT_DIR/frontend"
-npm run dev &
-FRONTEND_PID=$!
-echo "前端 PID: $FRONTEND_PID"
-
-echo ""
-echo -e "${GREEN}服务启动成功!${NC}"
-echo -e "  后端 API: http://localhost:8003"
-echo -e "  前端页面: http://localhost:3003"
-echo ""
-echo "按 Ctrl+C 停止服务"
-
-# 等待中断信号
-trap "kill $BACKEND_PID $FRONTEND_PID 2>/dev/null; exit" INT
-wait
-EOF
-
-chmod +x "$START_SCRIPT"
-log_success "启动脚本已创建: $START_SCRIPT"
+chmod +x "$MANAGE_SCRIPT"
+log_success "管理脚本已创建: $MANAGE_SCRIPT"
 
 # ====================
 # 部署完成
@@ -400,10 +531,23 @@ echo "  项目路径: $PROJECT_DIR"
 echo "  数据库: SQLite ($PROJECT_DIR/backend/warehouse.db)"
 echo "  后端端口: 8003"
 echo "  前端端口: 3003"
+echo "  日志路径: $PROJECT_DIR/logs/"
 echo ""
-echo "启动命令:"
+echo "服务管理命令:"
 echo "  cd $PROJECT_DIR"
-echo "  ./start_harmony.sh"
+echo "  ./manage.sh start     # 启动服务"
+echo "  ./manage.sh stop      # 停止服务"
+echo "  ./manage.sh restart   # 重启服务"
+echo "  ./manage.sh status    # 查看状态"
+echo "  ./manage.sh logs      # 查看日志"
+echo "  ./manage.sh enable    # 设置开机自启"
+echo "  ./manage.sh disable   # 取消开机自启"
+echo ""
+echo "Systemd 命令:"
+echo "  sudo systemctl start warehouse-backend    # 启动后端"
+echo "  sudo systemctl start warehouse-frontend   # 启动前端"
+echo "  sudo systemctl stop warehouse-backend     # 停止后端"
+echo "  sudo systemctl stop warehouse-frontend    # 停止前端"
 echo ""
 echo "访问地址:"
 echo "  后端 API: http://localhost:8003"
@@ -415,5 +559,9 @@ echo ""
 read -p "是否立即启动服务? (y/n): " start_now
 if [ "$start_now" = "y" ] || [ "$start_now" = "Y" ]; then
     echo ""
-    exec "$START_SCRIPT"
+    sudo systemctl start warehouse-backend
+    sudo systemctl start warehouse-frontend
+    log_success "服务已启动"
+    echo "  后端: http://localhost:8003"
+    echo "  前端: http://localhost:3003"
 fi
